@@ -1,6 +1,6 @@
 export type Nivel = "verde" | "amarillo" | "rojo";
 
-export type Escenario = "normal" | "hipoxia" | "taquicardia" | "fiebre" | "fatiga";
+export type Escenario = "normal" | "hipoxia" | "taquicardia" | "fiebre" | "fatiga" | "deterioro";
 
 export interface Astronauta {
   id: string;
@@ -130,4 +130,5 @@ export const ESCENARIOS: { id: Escenario; etiqueta: string }[] = [
   { id: "taquicardia", etiqueta: "Taquicardia" },
   { id: "fiebre", etiqueta: "Fiebre" },
   { id: "fatiga", etiqueta: "Fatiga" },
+  { id: "deterioro", etiqueta: "Deterioro lento" },
 ];

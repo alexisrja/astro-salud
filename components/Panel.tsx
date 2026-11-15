@@ -1,17 +1,25 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import * as almacen from "@/lib/almacen";
+import { cambiarApagon, enlaceInicial, registrar, restaurarEnlace, type EstadoEnlace } from "@/lib/enlace";
 import { esperaHastaSiguiente, planificar, type EstadoIncidente, type Incidente } from "@/lib/incidentes";
+import { LineaBase, type Desviacion } from "@/lib/lineaBase";
 import { evaluar, METRICAS, peorNivel } from "@/lib/salud";
 import { Simulador } from "@/lib/simulador";
 import { supabase } from "@/lib/supabase";
 import { ASTRONAUTAS, type Escenario, type Lectura, type Nivel } from "@/lib/tipos";
+import BarraEnlace from "./BarraEnlace";
 import FichaAstronauta from "./FichaAstronauta";
+import MedirPulso from "./MedirPulso";
 import TarjetaAstronauta, { COLOR, ETIQUETA } from "./TarjetaAstronauta";
 
 const MAX_PUNTOS = 60; // lecturas guardadas por astronauta para las gráficas
 const INTERVALO_MS = 2000;
 const SEGUNDOS_SIN_SENAL = 10;
+const RESUMEN_CADA_MS = 15_000; // cada cuánto se arma un resumen para la Tierra
+const GUARDAR_CADA_MS = 5_000;
+const VIGENCIA_GUARDADO_MS = 12 * 60 * 60 * 1000; // lo guardado hace más de 12 h se descarta
 // La misión empezó con la llegada de la comandante: su contador marca el día.
 const MAX_BITACORA = 6; // incidentes que se muestran en la bitácora
 const horaUTC = (ms: number) => new Date(ms).toISOString().slice(11, 19);
@@ -19,6 +27,15 @@ const DIA_DE_MISION = Math.max(...ASTRONAUTAS.map((a) => a.diasEnMision));
 
 type Historial = Record<string, Lectura[]>;
 type Escenarios = Record<string, Escenario>;
+
+/** Lo que se guarda en el dispositivo para sobrevivir a un reinicio. */
+interface Guardado {
+  version: number;
+  guardado: number;
+  historial: Historial;
+  lineaBase: unknown;
+  enlace: unknown;
+}
 
 const historialVacio = (): Historial => Object.fromEntries(ASTRONAUTAS.map((a) => [a.id, []]));
 const escenariosIniciales = (): Escenarios => Object.fromEntries(ASTRONAUTAS.map((a) => [a.id, "normal"]));
@@ -77,6 +94,35 @@ export default function Panel() {
   const ultimoIncidente = useRef<Incidente | null>(null);
   const sim = useRef<Simulador | null>(null);
 
+  // Línea base personal de cada astronauta: aprende su normal a bordo.
+  const lineaBase = useRef(new LineaBase());
+  const [desviaciones, setDesviaciones] = useState<Record<string, Desviacion[]>>({});
+  const [aprendiendo, setAprendiendo] = useState<Record<string, boolean>>({});
+
+  // Enlace con la Tierra: el apagón puede ser simulado o real (sin internet).
+  const [enlace, setEnlace] = useState<EstadoEnlace>(enlaceInicial);
+  const [sinInternet, setSinInternet] = useState(false);
+  const [aviso, setAviso] = useState<string | null>(null);
+  const [restaurado, setRestaurado] = useState<number | null>(null);
+
+  // Pulso medido con la cámara: sustituye al simulado de ese astronauta.
+  const [camara, setCamara] = useState<string | null>(null);
+  const [conPulsoReal, setConPulsoReal] = useState<string | null>(null);
+
+  // Pasa lecturas nuevas por la línea base, una vez y en orden de llegada.
+  // Se llama fuera de los actualizadores de estado (que React puede repetir).
+  const procesar = useCallback((lecturas: Lectura[]) => {
+    const lb = lineaBase.current;
+    const nuevas: Record<string, Desviacion[]> = {};
+    const aprende: Record<string, boolean> = {};
+    for (const l of lecturas) {
+      nuevas[l.astronauta_id] = lb.actualizar(l);
+      aprende[l.astronauta_id] = lb.aprendiendo(l.astronauta_id);
+    }
+    setDesviaciones((d) => ({ ...d, ...nuevas }));
+    setAprendiendo((a) => ({ ...a, ...aprende }));
+  }, []);
+
   // Reloj: también sirve para detectar relojes que dejaron de transmitir.
   useEffect(() => {
     // La hora no puede calcularse al renderizar (el HTML del servidor no coincidiría).
@@ -86,25 +132,91 @@ export default function Panel() {
     return () => clearInterval(t);
   }, []);
 
-  // Modo demo: el simulador corre en el navegador.
+  // Modo demo: el simulador corre en el navegador. Antes de arrancar se
+  // recupera lo guardado en el dispositivo, así un reinicio no borra lo aprendido.
   useEffect(() => {
     if (!modoDemo) return;
+    let activo = true;
+    let t: ReturnType<typeof setInterval> | undefined;
     const s = new Simulador();
     sim.current = s;
-    // Unos segundos de historia para que las gráficas no empiecen vacías.
-    let inicial = historialVacio();
-    for (let i = 20; i > 0; i--) inicial = agregar(inicial, s.tick(new Date(Date.now() - i * INTERVALO_MS)));
-    // Datos aleatorios: se generan tras montar, no al renderizar en el servidor.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setHistorial(inicial);
-    // tick() muta el simulador: se llama fuera del actualizador, que React
-    // puede ejecutar dos veces en modo estricto.
-    const t = setInterval(() => {
-      const lecturas = s.tick();
-      setHistorial((h) => agregar(h, lecturas));
-    }, INTERVALO_MS);
-    return () => clearInterval(t);
+
+    (async () => {
+      const g = await almacen.cargar<Guardado>();
+      if (!activo) return;
+      const vigente =
+        g && g.version === almacen.VERSION_DATOS && Date.now() - g.guardado < VIGENCIA_GUARDADO_MS && g.historial;
+      let inicial = historialVacio();
+      if (vigente) {
+        lineaBase.current.importar(g.lineaBase);
+        setEnlace(restaurarEnlace(g.enlace));
+        inicial = agregar(inicial, Object.values(g.historial).flat());
+        setRestaurado(g.guardado);
+      } else {
+        // Unos segundos de historia para que las gráficas no empiecen vacías.
+        const semilla: Lectura[] = [];
+        for (let i = 20; i > 0; i--) {
+          const lecturas = s.tick(new Date(Date.now() - i * INTERVALO_MS));
+          semilla.push(...lecturas);
+          inicial = agregar(inicial, lecturas);
+        }
+        procesar(semilla);
+      }
+      setHistorial(inicial);
+      // tick() muta el simulador: se llama fuera del actualizador, que React
+      // puede ejecutar dos veces en modo estricto.
+      t = setInterval(() => {
+        const lecturas = s.tick();
+        procesar(lecturas);
+        setHistorial((h) => agregar(h, lecturas));
+      }, INTERVALO_MS);
+    })();
+
+    return () => {
+      activo = false;
+      clearInterval(t);
+    };
+  }, [modoDemo, procesar]);
+
+  // Guardar en el dispositivo cada pocos segundos y al ocultar la pestaña.
+  const paraGuardar = useRef<{ historial: Historial; enlace: EstadoEnlace }>({ historial: {}, enlace: enlaceInicial() });
+  useEffect(() => {
+    paraGuardar.current = { historial, enlace };
+  }, [historial, enlace]);
+  useEffect(() => {
+    if (!modoDemo) return;
+    const guardarAhora = () => {
+      const { historial: h, enlace: e } = paraGuardar.current;
+      if (!Object.values(h).some((l) => l.length)) return;
+      const datos: Guardado = {
+        version: almacen.VERSION_DATOS,
+        guardado: Date.now(),
+        historial: h,
+        lineaBase: lineaBase.current.exportar(),
+        enlace: e,
+      };
+      void almacen.guardar(datos);
+    };
+    const t = setInterval(guardarAhora, GUARDAR_CADA_MS);
+    const alOcultar = () => document.visibilityState === "hidden" && guardarAhora();
+    document.addEventListener("visibilitychange", alOcultar);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", alOcultar);
+    };
   }, [modoDemo]);
+
+  // Internet real: si se cae, también es un apagón con la Tierra.
+  useEffect(() => {
+    const actualizar = () => setSinInternet(!navigator.onLine);
+    actualizar();
+    window.addEventListener("online", actualizar);
+    window.addEventListener("offline", actualizar);
+    return () => {
+      window.removeEventListener("online", actualizar);
+      window.removeEventListener("offline", actualizar);
+    };
+  }, []);
 
   // Modo Supabase: historia reciente + lecturas nuevas por Realtime.
   useEffect(() => {
@@ -120,7 +232,9 @@ export default function Panel() {
         .limit(MAX_PUNTOS * ASTRONAUTAS.length);
       if (!activo) return;
       if (error) return setError(`No se pudo leer la tabla lecturas: ${error.message}`);
-      setHistorial((h) => agregar(h, (data ?? []).reverse().map(normalizar)));
+      const previas = (data ?? []).reverse().map(normalizar);
+      procesar(previas);
+      setHistorial((h) => agregar(h, previas));
 
       const esc = await cliente.from("escenarios").select("astronauta_id, escenario");
       if (activo && esc.data) {
@@ -137,6 +251,7 @@ export default function Panel() {
         const lectura = normalizar(p.new);
         const llegada = Date.now();
         setRecibido((r) => ({ ...r, [lectura.astronauta_id]: llegada }));
+        procesar([lectura]);
         setHistorial((h) => agregar(h, [lectura]));
       })
       // Escenarios cambiados desde otro panel abierto.
@@ -157,7 +272,7 @@ export default function Panel() {
       activo = false;
       cliente.removeChannel(canal);
     };
-  }, []);
+  }, [procesar]);
 
   const cambiarEscenario = useCallback(async (id: string, escenario: Escenario) => {
     const previo = escenarios[id];
@@ -229,6 +344,51 @@ export default function Panel() {
     ASTRONAUTAS.forEach((a) => cambiarEscenario(a.id, "normal"));
   };
 
+  // Pulso de la cámara hacia el simulador (modo demo) o hacia Supabase.
+  const recibirPulso = useCallback((id: string, m: { fc: number; hrv: number | null } | null) => {
+    sim.current ??= new Simulador();
+    sim.current.setReal(id, m);
+    setConPulsoReal(m ? id : null);
+  }, []);
+  // En modo Supabase este panel envía las lecturas del astronauta medido.
+  useEffect(() => {
+    const s = sim.current;
+    if (!supabase || !conPulsoReal || !s) return;
+    const cliente = supabase;
+    const t = setInterval(async () => {
+      const lecturas = s.tick().filter((l) => l.astronauta_id === conPulsoReal);
+      const { error } = await cliente.from("lecturas").insert(lecturas);
+      if (error) setError(`No se pudo enviar el pulso medido: ${error.message}`);
+    }, INTERVALO_MS);
+    return () => clearInterval(t);
+  }, [conPulsoReal]);
+
+  const apagonEfectivo = enlace.apagon || sinInternet;
+  const alternarApagon = () => {
+    const { estado, enviadosAhora } = cambiarApagon(enlace, !enlace.apagon, Date.now());
+    setEnlace(estado);
+    if (!estado.apagon && !sinInternet) {
+      setAviso(
+        enviadosAhora > 0
+          ? `Enlace recuperado: ${enviadosAhora} ${enviadosAhora === 1 ? "resumen enviado" : "resúmenes enviados"} a la Tierra.`
+          : "Enlace recuperado.",
+      );
+    } else {
+      setAviso(null);
+    }
+  };
+  // Si vuelve el internet real y no hay apagón simulado, se vacía la cola.
+  useEffect(() => {
+    if (sinInternet || enlace.apagon || enlace.cola.length === 0) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setEnlace((e) => cambiarApagon({ ...e, apagon: true }, false, Date.now()).estado);
+  }, [sinInternet, enlace.apagon, enlace.cola.length]);
+  useEffect(() => {
+    if (!aviso) return;
+    const t = setTimeout(() => setAviso(null), 6000);
+    return () => clearTimeout(t);
+  }, [aviso]);
+
 
   // Estado de cada astronauta a partir de su última lectura.
   const estados = ASTRONAUTAS.map((a) => {
@@ -243,11 +403,40 @@ export default function Panel() {
   });
 
   const conDatos = estados.filter((e) => e.evaluacion && !e.sinSenal);
-  const nivelTripulacion: Nivel = peorNivel(conDatos.map((e) => e.evaluacion!.nivel));
+  // Fuera de su normal cuenta como precaución aunque los umbrales digan verde.
+  const desvDe = (id: string) => desviaciones[id] ?? [];
+  const nivelDe = (e: (typeof estados)[number]): Nivel =>
+    e.evaluacion!.nivel === "verde" && desvDe(e.astronauta.id).length > 0 ? "amarillo" : e.evaluacion!.nivel;
+  const nivelTripulacion: Nivel = peorNivel(conDatos.map(nivelDe));
+  const tendencias = conDatos.filter((e) => e.evaluacion!.nivel !== "rojo" && desvDe(e.astronauta.id).length > 0);
+  const etiquetaMetrica = (id: string) => METRICAS.find((m) => m.id === id)?.etiqueta.toLowerCase() ?? id;
   const alertas = conDatos.flatMap((e) =>
     e.evaluacion!.alertas.map((a) => ({ ...a, nombre: e.astronauta.nombre, id: `${e.astronauta.id}-${a.metrica}` })),
   );
   const criticas = alertas.filter((a) => a.nivel === "rojo");
+
+  // Resumen periódico para la Tierra: solo el estado general, no los datos crudos.
+  const resumenActual = useRef<{ nivel: Nivel; texto: string } | null>(null);
+  useEffect(() => {
+    resumenActual.current =
+      conDatos.length === 0
+        ? null
+        : {
+            nivel: nivelTripulacion,
+            texto: [
+              `Tripulación ${ETIQUETA[nivelTripulacion].toLowerCase()}`,
+              ...criticas.map((a) => `${a.nombre}: ${a.mensaje}`),
+              ...tendencias.map((e) => `${e.astronauta.nombre}: fuera de su normal`),
+            ].join(". "),
+          };
+  });
+  useEffect(() => {
+    const t = setInterval(() => {
+      const r = resumenActual.current;
+      if (r) setEnlace((e) => registrar(e, { ...r, creado: Date.now() }));
+    }, RESUMEN_CADA_MS);
+    return () => clearInterval(t);
+  }, []);
   const hayEscenarioActivo = Object.values(escenarios).some((e) => e !== "normal");
 
   // Texto para lectores de pantalla: no incluye los valores medidos, así solo
@@ -275,6 +464,12 @@ export default function Panel() {
             >
               {modoDemo ? "Modo demo" : "En vivo"}
             </span>
+            <span
+              className="rounded-[3px] border border-verde/50 px-1.5 py-0.5 text-xs text-verde"
+              title="La detección, la línea base y la memoria corren en este dispositivo, sin nube"
+            >
+              Detección a bordo
+            </span>
           </p>
         </div>
         <div className="sm:text-right">
@@ -285,6 +480,20 @@ export default function Panel() {
           </p>
         </div>
       </header>
+
+      <BarraEnlace
+        enlace={enlace}
+        apagon={apagonEfectivo}
+        sinInternet={sinInternet}
+        restaurado={restaurado}
+        onAlternar={alternarApagon}
+      />
+
+      {aviso && (
+        <p role="status" className="aviso -mt-6 rounded-[3px] border border-verde/50 px-4 py-3 text-sm text-verde">
+          {aviso}
+        </p>
+      )}
 
       {error && (
         <p role="alert" className="rounded-[3px] border border-rojo px-4 py-3 text-sm text-rojo">
@@ -354,6 +563,19 @@ export default function Panel() {
             ))}
           </ul>
         )}
+        {tendencias.length > 0 && (
+          <ul className="space-y-1 text-sm">
+            {tendencias.map((e) => (
+              <li key={e.astronauta.id} className="aparece text-amarillo">
+                ◆ <span className="font-medium">{e.astronauta.nombre}:</span> fuera de su normal en{" "}
+                {desvDe(e.astronauta.id)
+                  .map((d) => etiquetaMetrica(d.metrica))
+                  .join(", ")}
+                . Los umbrales todavía no lo marcan.
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       <section className="grid gap-x-8 gap-y-14 md:grid-cols-2 xl:grid-cols-4" aria-label="Tripulación">
@@ -364,6 +586,9 @@ export default function Panel() {
             historial={historial[e.astronauta.id]}
             escenario={escenarios[e.astronauta.id]}
             sinSenal={e.sinSenal}
+            desviaciones={desvDe(e.astronauta.id)}
+            aprendiendo={aprendiendo[e.astronauta.id] ?? true}
+            pulsoReal={camara === e.astronauta.id && conPulsoReal === e.astronauta.id}
             segundosDesde={e.segundosDesde}
             onEscenario={(esc) => elegirEscenario(e.astronauta.id, esc)}
             incidente={enCurso?.astronautaId === e.astronauta.id ? enCurso.tipo.titulo : null}
@@ -381,10 +606,25 @@ export default function Panel() {
             evaluacion={e?.evaluacion ?? null}
             fcActual={e?.ultima?.fc ?? null}
             sinSenal={e?.sinSenal ?? false}
+            desviaciones={e ? desvDe(e.astronauta.id) : []}
+            onMedirPulso={() => {
+              if (!e) return;
+              setFicha((f) => (f ? { ...f, abierta: false } : f));
+              setCamara(e.astronauta.id);
+            }}
             onCerrar={() => setFicha((f) => (f ? { ...f, abierta: false } : f))}
           />
         );
       })()}
+
+      {camara && (
+        <MedirPulso
+          key={camara}
+          astronauta={ASTRONAUTAS.find((a) => a.id === camara)!}
+          onMedicion={(m) => recibirPulso(camara, m)}
+          onCerrar={() => setCamara(null)}
+        />
+      )}
 
       <section aria-labelledby="bitacora-titulo" className="border-t border-borde pt-5">
         <h2 id="bitacora-titulo" className="ancho-expandido text-lg font-semibold">

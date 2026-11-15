@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { analiticaDe, ANTES, DESPUES, ESTUDIOS_OSDR, fueraDeRango } from "@/lib/analiticas";
+import type { Desviacion } from "@/lib/lineaBase";
 import type { Evaluacion } from "@/lib/salud";
 import type { Astronauta, Nivel } from "@/lib/tipos";
 import Corazon from "./Corazon";
@@ -15,6 +16,8 @@ interface Props {
   evaluacion: Evaluacion | null;
   fcActual: number | null;
   sinSenal: boolean;
+  desviaciones: Desviacion[];
+  onMedirPulso: () => void;
   onCerrar: () => void;
 }
 
@@ -24,7 +27,16 @@ const formatoHoras = (h: number) => (Number.isInteger(h) ? `${h} h` : `${h.toFix
  * Dosier del tripulante, centrado sobre el panel. Usa <dialog> nativo: atrapa
  * el foco, cierra con Escape y devuelve el foco a la columna que lo abrió.
  */
-export default function FichaAstronauta({ astronauta: a, abierta, evaluacion, fcActual, sinSenal, onCerrar }: Props) {
+export default function FichaAstronauta({
+  astronauta: a,
+  abierta,
+  evaluacion,
+  fcActual,
+  sinSenal,
+  desviaciones,
+  onMedirPulso,
+  onCerrar,
+}: Props) {
   const ref = useRef<HTMLDialogElement>(null);
 
   useEffect(() => {
@@ -34,10 +46,16 @@ export default function FichaAstronauta({ astronauta: a, abierta, evaluacion, fc
     if (!abierta && d.open) d.close();
   }, [abierta]);
 
-  const nivel: Nivel = evaluacion?.nivel ?? "verde";
   const vigente = !!evaluacion && !sinSenal;
+  // Igual que en la columna: fuera de su normal sin umbral rebasado es "Vigilar".
+  const soloBase = evaluacion
+    ? desviaciones.filter((d) => !evaluacion.alertas.some((x) => x.metrica === d.metrica))
+    : [];
+  const vigilar = vigente && evaluacion.nivel === "verde" && soloBase.length > 0;
+  const nivel: Nivel = vigilar ? "amarillo" : (evaluacion?.nivel ?? "verde");
+  const indice = evaluacion ? Math.max(0, evaluacion.indice - (vigente ? soloBase.length * 5 : 0)) : 0;
   const color = vigente ? COLOR[nivel] : "var(--color-tenue)";
-  const estado = sinSenal ? "Sin señal" : evaluacion ? ETIQUETA[nivel] : "Esperando datos";
+  const estado = sinSenal ? "Sin señal" : !evaluacion ? "Esperando datos" : vigilar ? "Vigilar" : ETIQUETA[nivel];
 
   return (
     <dialog
@@ -84,7 +102,7 @@ export default function FichaAstronauta({ astronauta: a, abierta, evaluacion, fc
               </button>
             </div>
 
-            <div className="flex items-center gap-5 border-y border-borde py-5">
+            <div className="flex flex-wrap items-center gap-5 border-y border-borde py-5">
               <Corazon fc={sinSenal ? null : fcActual} color={color} className="size-12" />
               <div>
                 <p className="ancho-condensado text-6xl font-bold leading-none tabular-nums" style={{ color }}>
@@ -95,10 +113,30 @@ export default function FichaAstronauta({ astronauta: a, abierta, evaluacion, fc
                 </p>
                 <p className="mt-2 text-sm" style={{ color }}>
                   <span className="font-semibold">{estado}</span>
-                  {vigente && <span className="text-tenue">, índice de salud {evaluacion.indice} de 100</span>}
+                  {vigente && <span className="text-tenue">, índice de salud {indice} de 100</span>}
                 </p>
               </div>
+              <button
+                type="button"
+                onClick={onMedirPulso}
+                className="ml-auto min-h-10 rounded-[3px] border border-texto px-3 text-sm font-medium hover:bg-texto hover:text-fondo focus-visible:outline-2 focus-visible:outline-acento"
+              >
+                Medir con cámara
+              </button>
             </div>
+
+            {desviaciones.length > 0 && !sinSenal && (
+              <section aria-labelledby="ficha-normal" className="border-l-2 border-amarillo pl-4">
+                <h3 id="ficha-normal" className="text-sm font-semibold text-amarillo">
+                  Fuera de su normal
+                </h3>
+                <ul className="mt-1 space-y-1 text-sm">
+                  {desviaciones.map((d) => (
+                    <li key={d.metrica}>◆ {d.mensaje}</li>
+                  ))}
+                </ul>
+              </section>
+            )}
 
             <dl className="grid grid-cols-2 gap-x-6 gap-y-4 text-sm sm:grid-cols-3">
               <Dato termino="Edad" valor={`${a.edad} años`} />

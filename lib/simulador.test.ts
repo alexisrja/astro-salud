@@ -50,3 +50,30 @@ test("un escenario para un astronauta desconocido se ignora", () => {
   s.setEscenario("no-existe", "fiebre");
   assert.equal(s.escenarios.has("no-existe"), false);
 });
+
+test("los valores de un reloj real sustituyen a los simulados", () => {
+  const s = new Simulador();
+  s.setReal(ID, { fc: 133, hrv: 41 });
+  assert.equal(s.tieneReal(ID), true);
+  const l = de(s, 1);
+  assert.equal(l.fc, 133);
+  assert.equal(l.hrv, 41);
+});
+
+test("sin intervalos RR la HRV sigue siendo la simulada", () => {
+  const s = new Simulador();
+  s.setReal(ID, { fc: 80, hrv: null });
+  const l = de(s, 1);
+  assert.equal(l.fc, 80);
+  assert.ok(l.hrv > 40, `hrv = ${l.hrv}`);
+});
+
+test("al quitar el reloj la simulación continúa desde el último valor real", () => {
+  const s = new Simulador();
+  s.setReal(ID, { fc: 150, hrv: null });
+  s.tick();
+  s.setReal(ID, null);
+  assert.equal(s.tieneReal(ID), false);
+  assert.ok(de(s, 1).fc > 100); // todavía cerca de 150, sin salto brusco
+  assert.ok(de(s, 40).fc < 100); // y termina volviendo a su valor de reposo
+});

@@ -1,3 +1,4 @@
+import type { Desviacion } from "@/lib/lineaBase";
 import { evaluar, METRICAS, META_EJERCICIO } from "@/lib/salud";
 import { ESCENARIOS, type Astronauta, type Escenario, type Lectura, type Nivel } from "@/lib/tipos";
 import Corazon from "./Corazon";
@@ -26,6 +27,9 @@ interface Props {
   historial: Lectura[];
   escenario: Escenario;
   sinSenal: boolean;
+  desviaciones: Desviacion[]; // métricas fuera del normal de este astronauta
+  aprendiendo: boolean; // la línea base todavía junta datos
+  pulsoReal: boolean; // el pulso viene de la cámara, no del simulador
   segundosDesde: number | null;
   onEscenario: (e: Escenario) => void;
   onAbrirFicha: () => void;
@@ -42,6 +46,9 @@ export default function TarjetaAstronauta({
   historial,
   escenario,
   sinSenal,
+  desviaciones,
+  aprendiendo,
+  pulsoReal,
   segundosDesde,
   onEscenario,
   onAbrirFicha,
@@ -49,12 +56,19 @@ export default function TarjetaAstronauta({
 }: Props) {
   const ultima = historial.at(-1);
   const evaluacion = ultima ? evaluar(ultima) : null;
-  const nivel: Nivel = evaluacion?.nivel ?? "verde";
   const vigente = !!evaluacion && !sinSenal;
+  // Desviaciones que todavía no rebasan un umbral: solo las ve la línea base.
+  const soloBase = evaluacion
+    ? desviaciones.filter((d) => !evaluacion.alertas.some((a) => a.metrica === d.metrica))
+    : [];
+  const vigilar = vigente && evaluacion.nivel === "verde" && soloBase.length > 0;
+  const nivel: Nivel = vigilar ? "amarillo" : (evaluacion?.nivel ?? "verde");
+  // Cada métrica fuera de su normal resta 5 puntos al índice.
+  const indice = evaluacion ? Math.max(0, evaluacion.indice - (vigente ? soloBase.length * 5 : 0)) : 0;
   const color = vigente ? COLOR[nivel] : TENUE;
   const colorDe = (n: Nivel) => (sinSenal ? TENUE : COLOR[n]);
   const idSelect = `escenario-${astronauta.id}`;
-  const estado = sinSenal ? "Sin señal" : evaluacion ? ETIQUETA[nivel] : "Esperando datos";
+  const estado = sinSenal ? "Sin señal" : !evaluacion ? "Esperando datos" : vigilar ? "Vigilar" : ETIQUETA[nivel];
   const vivo = <K extends keyof Lectura>(k: K) => (ultima && !sinSenal ? ultima[k] : null);
 
   const nFc = evaluacion?.porMetrica.fc ?? "verde";
@@ -100,13 +114,14 @@ export default function TarjetaAstronauta({
 
       <p className="mt-3 flex items-baseline gap-2 text-sm" style={{ color }}>
         <span className="font-semibold">{estado}</span>
-        {vigente && <span className="text-tenue">índice de salud {evaluacion.indice}</span>}
+        {vigente && <span className="text-tenue">índice de salud {indice}</span>}
       </p>
 
       <div className="mt-5 grid grid-cols-2 gap-x-4 border-t border-borde pt-4">
         <Lectura
           icono={<Corazon fc={vivo("fc")} color={colorDe(nFc)} className="size-5" />}
           etiqueta="Pulso"
+          insignia={pulsoReal ? "Cámara en vivo" : null}
           titulo="Frecuencia cardiaca"
           valor={ultima?.fc ?? null}
           unidad="lpm"
@@ -168,14 +183,26 @@ export default function TarjetaAstronauta({
       <ul className="mt-4 min-h-5 space-y-1 text-sm">
         {sinSenal ? (
           <li className="text-tenue">No llegan lecturas del reloj. Revisa la conexión.</li>
-        ) : evaluacion && evaluacion.alertas.length > 0 ? (
-          evaluacion.alertas.map((a) => (
-            <li key={a.metrica} style={{ color: COLOR[a.nivel] }}>
-              {a.mensaje}
-            </li>
-          ))
+        ) : evaluacion && (evaluacion.alertas.length > 0 || soloBase.length > 0) ? (
+          <>
+            {evaluacion.alertas.map((a) => (
+              <li key={a.metrica} style={{ color: COLOR[a.nivel] }}>
+                {a.mensaje}
+              </li>
+            ))}
+            {soloBase.map((d) => (
+              <li key={`base-${d.metrica}`} className="aparece" style={{ color: COLOR.amarillo }}>
+                ◆ {d.mensaje}
+              </li>
+            ))}
+          </>
         ) : (
           <li className="text-tenue">Sin alertas.</li>
+        )}
+        {vigente && (aprendiendo || soloBase.length > 0) && (
+          <li className="pt-1 text-xs text-tenue">
+            {aprendiendo ? "Aprendiendo su normal…" : "◆ fuera de su normal personal, aunque siga dentro de los umbrales"}
+          </li>
         )}
       </ul>
 
@@ -204,6 +231,7 @@ export default function TarjetaAstronauta({
 function Lectura({
   icono,
   etiqueta,
+  insignia = null,
   titulo,
   valor,
   unidad,
@@ -212,6 +240,7 @@ function Lectura({
 }: {
   icono: React.ReactNode;
   etiqueta: string;
+  insignia?: string | null;
   titulo: string;
   valor: number | null;
   unidad: string;
@@ -224,6 +253,12 @@ function Lectura({
         {icono}
         {etiqueta}
       </p>
+      {insignia && (
+        <p className="mt-1 flex items-center gap-1.5 text-xs font-medium text-rojo">
+          <span className="pulso inline-block size-1.5 rounded-full bg-rojo" aria-hidden />
+          {insignia}
+        </p>
+      )}
       <p className="ancho-condensado mt-1 text-5xl font-bold leading-none tabular-nums" style={{ color }}>
         {valor ?? "--"}
         <span className="ml-1 text-sm font-normal text-tenue [font-variation-settings:'wdth'_100]">{unidad}</span>

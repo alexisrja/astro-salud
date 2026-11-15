@@ -1,5 +1,6 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Archivo } from "next/font/google";
+import RegistroSW from "@/components/RegistroSW";
 import "./globals.css";
 
 // Una sola familia con eje de anchura: expandida para la marca y los nombres (como la cinta
@@ -8,13 +9,19 @@ const archivo = Archivo({ subsets: ["latin"], axes: ["wdth"], variable: "--fuent
 
 export const metadata: Metadata = {
   title: "Órbita Vital | Salud de la tripulación",
-  description: "Monitoreo en tiempo real de la salud de astronautas mediante smartwatch",
+  description: "Monitoreo de la salud de astronautas con detección a bordo, sin depender de la Tierra",
+  appleWebApp: { capable: true, title: "Órbita Vital", statusBarStyle: "black-translucent" },
 };
+
+export const viewport: Viewport = { themeColor: "#000000" };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="es" className={`h-full antialiased ${archivo.variable}`}>
-      <body className="min-h-full">{children}</body>
+      <body className="min-h-full">
+        {children}
+        <RegistroSW />
+      </body>
     </html>
   );
 }
